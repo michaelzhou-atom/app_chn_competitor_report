@@ -1,0 +1,17 @@
+flask
+flask_sqlalchemy
+flask-migrate
+flask-cors
+flask-caching
+flask-testing
+pytest 
+gunicorn
+python-dotenv
+pandas
+openpyxl
+boto3
+psycopg2-binary
+pyjwt
+requests
+werkzeug
+sqlalchemy-redshift
