@@ -1,0 +1,29 @@
+logs/
+build/
+
+*bin
+.classpath
+.project
+/target/
+*.class
+*pom.properties
+target/classes/
+target/
+target/maven-status/
+target/maven-status/maven-compiler-plugin/compile/default-compile/
+*.lst
+/.idea
+*.iml
+dependency-reduced-pom.xml
+.settings
+
+
+# Ignore Python virtual environment and environment file
+/venv
+.env
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd

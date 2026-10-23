@@ -1,0 +1,7 @@
+@Library('jenkins_shared_libraries_cn')
+import com.tapestry.eds.deployRepo
+node {
+    String emailNotificationList = "basghar@tapestry.com"
+
+    new deployRepo(this, emailNotificationList).execute()
+}

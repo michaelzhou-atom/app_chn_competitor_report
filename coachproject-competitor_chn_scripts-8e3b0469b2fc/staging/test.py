@@ -1,0 +1,1 @@
+##Placed file to make the stage folder appear, as it disappears in s3 if no folder exist

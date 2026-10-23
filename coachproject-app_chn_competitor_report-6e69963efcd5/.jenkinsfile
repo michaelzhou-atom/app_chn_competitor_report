@@ -1,0 +1,13 @@
+/*@Library('jenkins_shared_libraries_cn')
+import com.tapestry.eds.deployRepo
+node {
+    String emailNotificationList = ""
+
+    new deployRepo(this, emailNotificationList).execute()
+}
+*/
+@Library('jenkins_shared_libraries_cn')
+import com.tapestry.eds.deployDags
+node {
+    new deployRepo(this).execute()
+}
