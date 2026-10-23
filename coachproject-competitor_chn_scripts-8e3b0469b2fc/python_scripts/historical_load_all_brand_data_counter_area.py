@@ -1,0 +1,960 @@
+# -*- coding: utf-8 -*-
+# @Time : 2025/11/14 12:28
+# @Author : Chuqingwen
+# @Version : 1.0.1
+# @description: agg competitor_sales_collection_store_location data for all brands to store level and area level and load into agg_competitor_sales_collection_store_location
+import sys
+import pandas as pd
+import numpy as np
+# from config import *
+from my_tools import *
+from awsglue.utils import getResolvedOptions
+from tpr_python_util.connectors.redshift_cn_connector import RedshiftCNConnector
+# from tpr_python_util.connectors.snowflake_connector import *
+import boto3
+import json
+
+# basic param
+# mode = 'production'
+args = getResolvedOptions(sys.argv, ['env', 'region', 'iam', 'bucket_name'])
+env = args['env']
+region = args['region']
+iam = args['iam']
+bucket_name = args['bucket_name']
+
+# read competitor_sales_collection data from mysql
+# db = SnowflakeConnector.ssh(private_key_name='SecretsRotationManager/Snowflake/ssh/SVCDSAUTOPRD1',username='SVCDSAUTOPRD1')
+
+secret_name = f"tpr-{env}-redshift-credentials"
+# secret_name = f"qa-redshift-admin-secret"
+sc_client = boto3.client('secretsmanager', region_name=region)
+sc_value = json.loads(sc_client.get_secret_value(SecretId=secret_name)['SecretString'])
+
+host = sc_value['host']
+usr = sc_value['username']
+pwd = sc_value['password']
+db_crm = f"{env}_crm"
+db_ind360 = f"{env}_ind360"
+rs_conn_crm = RedshiftCNConnector(host=host, username=usr, password=pwd, database=db_crm)
+rs_conn_ind360 = RedshiftCNConnector(host=host, username=usr, password=pwd, database=db_ind360)
+year_iterator = 2019
+month_iterator = 7
+while (year_iterator <= 2025 and month_iterator <=10 ) or (year_iterator <= 2024 and month_iterator <=12 ):
+    end_year = str(year_iterator)
+    start_year = str(year_iterator - 1)
+    month = str(month_iterator).zfill(2)
+    dt = datetime(int(end_year), int(month), 1) + relativedelta(months=1)
+    print('end_year: ', end_year, 'start_year: ', start_year, 'month: ', month)
+    def storeCodeJoinCounterArea(df_source, df_counterarea):
+        #df_counterarea = df_counterarea.groupby("store_code", as_index=False).first()
+        df_source = df_source.merge(
+            df_counterarea[['store_code','city_tier','city','area','district','province']],
+            left_on='store_code', right_on='store_code',
+            how='left', suffixes=('', '_counter')
+        )
+        print("Area _Code")
+        print(df_source[['store_code', 'area','city_tier','city','area','district','province']].head())
+        #df_source.rename(columns={'area_level': 'area'}, inplace=True)
+        print(df_source.columns)
+        return df_source
+    print('end_year: ', end_year, 'start_year: ', start_year, 'month: ', month)
+    
+    # get data of ty years
+    df_source = rs_conn_ind360.get_records(
+        """select year,month,store_code,brand_name, amount, comp, store_category from landing.all_brand_sales_data_collection where year in ({}, {}) and month = {}""".format(
+            start_year, end_year, month))
+    # divide data into two years
+    df_source['year'] = df_source['year'].astype(str)
+    df_source['month'] = df_source['month'].astype(str)
+    df_source['year_mth'] = df_source['year'] + df_source['month'].str.zfill(2)
+    df_source['year_mth'] = df_source['year_mth'].astype(int)
+    
+    df_source_ty = df_source[df_source['year'] == end_year]
+    df_source_ty['year'] = df_source['year'].astype(int)
+    df_source_ty['month'] = df_source['month'].astype(int)
+    
+    df_source_ly = df_source[df_source['year'] == start_year]
+    df_source_ly.rename(columns={'amount': 'ly_amount'}, inplace=True)
+    df_source_ly = df_source_ly[['store_code', 'brand_name', 'store_category', 'ly_amount']]
+    
+    df_source = df_source_ty.merge(df_source_ly, on=['store_code', 'brand_name', 'store_category'], how='left')
+    print('checkpint: ', df_source)
+    df_source['amount'] = df_source['amount'].astype('double')
+    
+    df_source['ly_amount'] = df_source['ly_amount'].astype('double')
+    
+    # df_source = df_source[df_source['comp'] == 'Y'].reset_index()
+    
+    df_counterarea = rs_conn_crm.get_records("""select brand_code,door_code as store_code,door_desc as store_name,district_desc as district,area_desc as area,state as province,city_tier,city from cdlcrm.cdl_mstr_location where door_code like 'CN%' and store_nbr not like '%-VIRTUAL%' """)
+    
+    # get all store name 
+    df_store_name = df_counterarea[['store_code','store_name']]
+    df_store_name["store_code"] = df_store_name["store_code"].astype(str)
+    print(f"Store name: {df_store_name}")
+
+
+    print(df_source.head(10))
+    # add coach and coach pure loc brand tag
+    df_source['brand_comp'] = df_source['brand_name'] + '-' + df_source['comp']
+    df_source['LV_tag'] = ''
+    df_source['LV_pure_tag'] = ''
+    df_source['Gucci_tag'] = ''
+    df_source['Gucci_pure_tag'] = ''
+    df_source['Dior_tag'] = ''
+    df_source['Dior_pure_tag'] = ''
+    df_source['MichaelKors_tag'] = ''
+    df_source['MichaelKors_pure_tag'] = ''
+    df_source['Prada_tag'] = ''
+    df_source['MKGucci_tag'] = ''
+    df_source['KS_tag'] = ''
+    df_source['MCM_tag'] = ''
+    
+    # add Coach and Coach Pure loc brand for Retail
+    df_source_retail = df_source[df_source['store_category'] == 'Retail']
+    record = df_source_retail[['store_code', 'brand_comp']].drop_duplicates().to_dict(orient='record')
+    
+    dict = {}
+    for i in record:
+        dict.setdefault(i['store_code'], []).append(i['brand_comp'])
+    
+    # Coach
+    for i in dict.keys():
+        if ('Coach-Y' in dict[i]) and ('LV-Y' in dict[i]):
+            df_source_retail.loc[
+                (df_source_retail['store_code'] == i) & (df_source_retail['brand_name'] == 'Coach'), 'LV_tag'] = 'Y'
+        if ('Coach-Y' in dict[i]) and ('Gucci-Y' in dict[i]):
+            df_source_retail.loc[
+                (df_source_retail['store_code'] == i) & (df_source_retail['brand_name'] == 'Coach'), 'Gucci_tag'] = 'Y'
+        if ('Coach-Y' in dict[i]) and ('Dior-Y' in dict[i]):
+            df_source_retail.loc[
+                (df_source_retail['store_code'] == i) & (df_source_retail['brand_name'] == 'Coach'), 'Dior_tag'] = 'Y'
+        if ('Coach-Y' in dict[i]) and ('Michael Kors-Y' in dict[i]):
+            df_source_retail.loc[(df_source_retail['store_code'] == i) & (
+                    df_source_retail['brand_name'] == 'Coach'), 'MichaelKors_tag'] = 'Y'
+    
+    df_source_LV = df_source_retail[df_source_retail['LV_tag'] == 'Y']
+    df_source_LV['brand_name'] = 'Coach (LV Locations)'
+    
+    df_source_Gucci = df_source_retail[df_source_retail['Gucci_tag'] == 'Y']
+    df_source_Gucci['brand_name'] = 'Coach (Gucci Locations)'
+    
+    df_source_Dior = df_source_retail[df_source_retail['Dior_tag'] == 'Y']
+    df_source_Dior['brand_name'] = 'Coach (Dior Locations)'
+    
+    df_source_MK = df_source_retail[df_source_retail['MichaelKors_tag'] == 'Y']
+    df_source_MK['brand_name'] = 'Coach (Michael Kors Locations)'
+    
+    # Coach Pure
+    for i in dict.keys():
+        if ('Coach (pure)-Y' in dict[i]) and ('LV-Y' in dict[i]):
+            df_source_retail.loc[(df_source_retail['store_code'] == i) & (
+                    df_source_retail['brand_name'] == 'Coach (pure)'), 'LV_pure_tag'] = 'Y'
+        if ('Coach (pure)-Y' in dict[i]) and ('Gucci-Y' in dict[i]):
+            df_source_retail.loc[(df_source_retail['store_code'] == i) & (
+                    df_source_retail['brand_name'] == 'Coach (pure)'), 'Gucci_pure_tag'] = 'Y'
+        if ('Coach (pure)-Y' in dict[i]) and ('Dior-Y' in dict[i]):
+            df_source_retail.loc[(df_source_retail['store_code'] == i) & (
+                    df_source_retail['brand_name'] == 'Coach (pure)'), 'Dior_pure_tag'] = 'Y'
+        if ('Coach (pure)-Y' in dict[i]) and ('Michael Kors-Y' in dict[i]):
+            df_source_retail.loc[(df_source_retail['store_code'] == i) & (
+                    df_source_retail['brand_name'] == 'Coach (pure)'), 'MichaelKors_pure_tag'] = 'Y'
+    
+    df_source_LV_pure = df_source_retail[df_source_retail['LV_pure_tag'] == 'Y']
+    df_source_LV_pure['brand_name'] = 'Coach pure (LV Locations)'
+    
+    df_source_Gucci_pure = df_source_retail[df_source_retail['Gucci_pure_tag'] == 'Y']
+    df_source_Gucci_pure['brand_name'] = 'Coach pure (Gucci Locations)'
+    
+    df_source_Dior_pure = df_source_retail[df_source_retail['Dior_pure_tag'] == 'Y']
+    df_source_Dior_pure['brand_name'] = 'Coach pure (Dior Locations)'
+    
+    df_source_MK_pure = df_source_retail[df_source_retail['MichaelKors_pure_tag'] == 'Y']
+    df_source_MK_pure['brand_name'] = 'Coach pure (Michael Kors Locations)'
+    
+    df_source_retail = pd.concat(
+        [df_source_retail, df_source_LV, df_source_Gucci, df_source_Dior, df_source_MK, df_source_LV_pure,
+         df_source_Gucci_pure, df_source_Dior_pure, df_source_MK_pure])
+    
+    # add Coach loc brand for Outlet
+    df_source_outlet = df_source[df_source['store_category'] == 'Outlet']
+    record = df_source_outlet[['store_code', 'brand_comp']].drop_duplicates().to_dict(orient='record')
+    dict = {}
+    for i in record:
+        dict.setdefault(i['store_code'], []).append(i['brand_comp'])
+    
+    for i in dict.keys():
+        if ('Coach-Y' in dict[i]) and ('Gucci-Y' in dict[i]):
+            df_source_outlet.loc[
+                (df_source_outlet['store_code'] == i) & (df_source_outlet['brand_name'] == 'Coach'), 'Gucci_tag'] = 'Y'
+        if ('Coach-Y' in dict[i]) & ('Prada-Y' in dict[i]):
+            df_source_outlet.loc[
+                (df_source_outlet['store_code'] == i) & (df_source_outlet['brand_name'] == 'Coach'), 'Prada_tag'] = 'Y'
+        if ('Coach-Y' in dict[i]) and ('Michael Kors-Y' in dict[i]):
+            df_source_outlet.loc[(df_source_outlet['store_code'] == i) & (
+                    df_source_outlet['brand_name'] == 'Coach'), 'MichaelKors_tag'] = 'Y'
+        if ('Coach-Y' in dict[i]) and ('Michael Kors-Y' in dict[i]) and ('Gucci-Y' in dict[i]):
+            df_source_outlet.loc[
+                (df_source_outlet['store_code'] == i) & (df_source_outlet['brand_name'] == 'Coach'), 'MKGucci_tag'] = 'Y'
+    
+    df_source_Gucci = df_source_outlet[df_source_outlet['Gucci_tag'] == 'Y']
+    df_source_Gucci['brand_name'] = 'Coach (Gucci Locations)'
+    
+    df_source_Prada = df_source_outlet[df_source_outlet['Prada_tag'] == 'Y']
+    df_source_Prada['brand_name'] = 'Coach (Prada Locations)'
+    
+    df_source_MK = df_source_outlet[df_source_outlet['MichaelKors_tag'] == 'Y']
+    df_source_MK['brand_name'] = 'Coach (Michael Kors Locations)'
+    
+    df_source_MKGucci = df_source_outlet[df_source_outlet['MKGucci_tag'] == 'Y']
+    df_source_MKGucci['brand_name'] = 'Coach (Gucci & Michael Kors Locations)'
+    
+    # add Coach x-loc brand for Outlet
+    df_source = df_source[df_source['store_category'] == 'Outlet']
+    df_source = df_source[['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']]
+    df_source_coach = df_source[df_source['brand_name'] == 'Coach']
+    df_source_gucci = df_source[df_source['brand_name'] == 'Gucci']
+    df_source_mk = df_source[df_source['brand_name'] == 'Michael Kors']
+    df_source_ks = df_source[df_source['brand_name'] == 'Kate Spade']
+    df_source_mcm = df_source[df_source['brand_name'] == 'MCM']
+    
+    df_source_coach.columns = ['year', 'month', 'store_code', 'brand_name_coach', 'amount_coach', 'store_category']
+    df_source_gucci.columns = ['year', 'month', 'store_code', 'brand_name_gucci', 'amount_gucci', 'store_category']
+    df_source_mk.columns = ['year', 'month', 'store_code', 'brand_name_mk', 'amount_mk', 'store_category']
+    df_source_ks.columns = ['year', 'month', 'store_code', 'brand_name_ks', 'amount_ks', 'store_category']
+    df_source_mcm.columns = ['year', 'month', 'store_code', 'brand_name_mcm', 'amount_mcm', 'store_category']
+    
+    df_gucci_x_loc = df_source_coach.merge(df_source_gucci, on=['year', 'month', 'store_code', 'store_category'],
+                                           how='inner')
+    df_mk_x_loc = df_source_coach.merge(df_source_mk, on=['year', 'month', 'store_code', 'store_category'], how='inner')
+    df_ks_x_loc = df_source_coach.merge(df_source_ks, on=['year', 'month', 'store_code', 'store_category'], how='inner')
+    df_mcm_x_loc = df_source_coach.merge(df_source_mcm, on=['year', 'month', 'store_code', 'store_category'], how='inner')
+    
+    df_gucci_x_loc.fillna(value=0)
+    df_mk_x_loc.fillna(value=0)
+    df_ks_x_loc.fillna(value=0)
+    df_mcm_x_loc.fillna(value=0)
+    
+    df_gucci_x_loc = df_gucci_x_loc.loc[(df_gucci_x_loc['amount_gucci'] > 0) & (df_gucci_x_loc['amount_coach'] > 0)]
+    df_mk_x_loc = df_mk_x_loc.loc[(df_mk_x_loc['amount_mk'] > 0) & (df_mk_x_loc['amount_coach'] > 0)]
+    df_ks_x_loc = df_ks_x_loc.loc[(df_ks_x_loc['amount_ks'] > 0) & (df_ks_x_loc['amount_coach'] > 0)]
+    df_mcm_x_loc = df_mcm_x_loc.loc[(df_mcm_x_loc['amount_mcm'] > 0) & (df_mcm_x_loc['amount_coach'] > 0)]
+    
+    df_source_coach_gucci = df_gucci_x_loc[
+        ['year', 'month', 'store_code', 'brand_name_coach', 'amount_coach', 'store_category']]
+    df_source_coach_mk = df_mk_x_loc[['year', 'month', 'store_code', 'brand_name_coach', 'amount_coach', 'store_category']]
+    df_source_coach_ks = df_ks_x_loc[['year', 'month', 'store_code', 'brand_name_coach', 'amount_coach', 'store_category']]
+    df_source_coach_mcm = df_mcm_x_loc[
+        ['year', 'month', 'store_code', 'brand_name_coach', 'amount_coach', 'store_category']]
+    df_source_gucci_x = df_gucci_x_loc[
+        ['year', 'month', 'store_code', 'brand_name_gucci', 'amount_gucci', 'store_category']]
+    df_source_mk_x = df_mk_x_loc[['year', 'month', 'store_code', 'brand_name_mk', 'amount_mk', 'store_category']]
+    df_source_ks_x = df_ks_x_loc[['year', 'month', 'store_code', 'brand_name_ks', 'amount_ks', 'store_category']]
+    df_source_mcm_x = df_mcm_x_loc[['year', 'month', 'store_code', 'brand_name_mcm', 'amount_mcm', 'store_category']]
+    
+    df_source_coach_gucci.columns = ['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']
+    df_source_coach_mk.columns = ['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']
+    df_source_coach_ks.columns = ['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']
+    df_source_coach_mcm.columns = ['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']
+    df_source_gucci_x.columns = ['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']
+    df_source_mk_x.columns = ['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']
+    df_source_ks_x.columns = ['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']
+    df_source_mcm_x.columns = ['year', 'month', 'store_code', 'brand_name', 'amount', 'store_category']
+    
+    df_source_coach_gucci['brand_name'] = 'Coach (Gucci X-Locations)'
+    df_source_coach_mk['brand_name'] = 'Coach (Michael Kors X-Locations)'
+    df_source_coach_ks['brand_name'] = 'Coach (Kate Spade X-Locations)'
+    df_source_coach_mcm['brand_name'] = 'Coach (MCM X-Locations)'
+    df_source_gucci_x['brand_name'] = 'Gucci (X-Locations)'
+    df_source_mk_x['brand_name'] = 'Michael Kors (X-Locations)'
+    df_source_ks_x['brand_name'] = 'Kate Spade (X-Locations)'
+    df_source_mcm_x['brand_name'] = 'MCM (X-Locations)'
+    
+    df_source_coach_gucci['comp'] = 'Y'
+    df_source_coach_mk['comp'] = 'Y'
+    df_source_coach_ks['comp'] = 'Y'
+    df_source_coach_mcm['comp'] = 'Y'
+    df_source_gucci_x['comp'] = 'Y'
+    df_source_mk_x['comp'] = 'Y'
+    df_source_ks_x['comp'] = 'Y'
+    df_source_mcm_x['comp'] = 'Y'
+    
+    df_source_coach_gucci = df_source_coach_gucci[
+        ['year', 'month', 'store_code', 'brand_name', 'amount', 'comp', 'store_category']]
+    df_source_coach_mk = df_source_coach_mk[
+        ['year', 'month', 'store_code', 'brand_name', 'amount', 'comp', 'store_category']]
+    df_source_coach_ks = df_source_coach_ks[
+        ['year', 'month', 'store_code', 'brand_name', 'amount', 'comp', 'store_category']]
+    df_source_coach_mcm = df_source_coach_mcm[
+        ['year', 'month', 'store_code', 'brand_name', 'amount', 'comp', 'store_category']]
+    df_source_gucci_x = df_source_gucci_x[['year', 'month', 'store_code', 'brand_name', 'amount', 'comp', 'store_category']]
+    df_source_mk_x = df_source_mk_x[['year', 'month', 'store_code', 'brand_name', 'amount', 'comp', 'store_category']]
+    df_source_ks_x = df_source_ks_x[['year', 'month', 'store_code', 'brand_name', 'amount', 'comp', 'store_category']]
+    df_source_mcm_x = df_source_mcm_x[['year', 'month', 'store_code', 'brand_name', 'amount', 'comp', 'store_category']]
+    
+    df_source_coach_x_loc = pd.concat(
+        [df_source_coach_gucci, df_source_coach_mk, df_source_coach_ks, df_source_coach_mcm, df_source_gucci_x,
+         df_source_mk_x, df_source_ks_x, df_source_mcm_x])
+    
+    df_source_outlet = pd.concat(
+        [df_source_outlet, df_source_Gucci, df_source_Prada, df_source_MK, df_source_MKGucci, df_source_coach_x_loc])
+    # df_source_outlet = pd.concat([df_source_outlet, df_source_Gucci, df_source_Prada, df_source_MK, df_source_MKGucci])
+    
+    
+    # union
+    df_source = pd.concat([df_source_retail, df_source_outlet])
+    df_source = df_source[['year', 'month', 'store_code', 'brand_name', 'amount', 'ly_amount', 'year_mth', 'comp',
+                           'store_category']].reset_index(drop=True)
+    
+    df_source = storeCodeJoinCounterArea(df_source,df_counterarea)
+    
+    df_source_total_amount = df_source
+    
+    df_source = df_source[df_source['comp'] == 'Y'].reset_index()
+    
+    # add column competitor_type
+    # define mapping dict for Competitor Type
+    dict_competitor_type_retail = {
+        'LV': 'Big Three Luxury Brands'
+        , 'Gucci': 'Big Three Luxury Brands'
+        , 'Dior': 'Big Three Luxury Brands'
+        , 'Chanel': 'Other Luxury'
+        , 'Burberry': 'Other Luxury'
+        , 'Prada': 'Other Luxury'
+        , 'Hermes': 'Other Luxury'
+        , 'Bottega Veneta': 'Other Luxury'
+        , 'Balenciaga': 'Other Luxury'
+        , 'Fendi': 'Other Luxury'
+        , 'Saint Laurent': 'Other Luxury'
+        , 'Valentino': 'Other Luxury'
+        , 'Stuart Weitzman': 'Other Luxury'
+        , 'Loewe': 'Other Luxury'
+        , 'Longchamp': 'Other Luxury'
+        , 'Furla': 'Other Luxury'
+        , 'Kate Spade': 'Other Luxury'
+        , 'Tory Burch': 'Other Luxury'
+        , 'Michael Kors': 'Other Luxury'
+        , 'Ralph Lauren':'RTW'
+        , 'MCM': 'Other Luxury'
+        , 'CharlesKeith': 'Other Luxury'
+        , 'MiuMiu': 'Other Luxury'
+        , 'Songmont': 'Other Luxury'
+        , "Hugo Boss": "Men's"
+        , 'AcneStudio': 'RTW'
+        , 'Sandro': 'RTW'
+        , 'Maje': 'RTW'
+        , 'Lancome': 'Lancome'
+        , 'Nike': 'FTW'
+        , 'Adidas': 'FTW'
+        , 'On': 'FTW'
+        , 'Hoka': 'FTW'
+    }
+    
+    dict_competitor_type_outlet = {
+        'Gucci': 'Big Three Luxury Brands'
+        , 'Burberry': 'Big Three Luxury Brands'
+        , 'Prada': 'Big Three Luxury Brands'
+        , 'Bottega Veneta': 'Other Luxury'
+        , 'Balenciaga': 'Other Luxury'
+        , 'Ferragamo': 'Other Luxury'
+        , 'Fendi': 'Other Luxury'
+        , 'Loewe': 'Other Luxury'
+        , 'Stuart Weitzman': 'Other Luxury'
+        , 'Michael Kors': 'Other Luxury'
+        , 'Kate Spade': 'Other Luxury'
+        , 'Tory Burch': 'Other Luxury'
+        , 'Furla': 'Other Luxury'
+        , 'MCM': 'Other Luxury'
+        , 'CharlesKeith': 'Other Luxury'
+        , "Hugo Boss": "Men's"
+        , 'AcneStudio': 'RTW'
+        , 'Ralph Lauren': 'RTW'
+        , 'Arcteryx': 'RTW'
+        , 'Descente': 'RTW'
+        , 'Fila': 'RTW'
+        , 'Lululemon': 'RTW'
+        , 'Moncler': 'RTW'
+        , 'Canada Goose': 'RTW'
+        , 'Nike': 'FTW'
+        ,'Adidas': 'FTW'
+        ,'On': 'FTW'
+        ,'Hoka': 'FTW'
+    }
+    
+    # add mapping competitor_type columns to df_source
+    df_source_retailTypeMapping = df_source[df_source['store_category'] == 'Retail']
+    df_source_outletTypeMapping = df_source[df_source['store_category'] == 'Outlet']
+    
+    df_source_retailTypeMapping['competitor_type'] = df_source_retailTypeMapping['brand_name'].map(
+        dict_competitor_type_retail)
+    df_source_outletTypeMapping['competitor_type'] = df_source_outletTypeMapping['brand_name'].map(
+        dict_competitor_type_outlet)
+    
+    df_source = pd.concat([df_source_retailTypeMapping, df_source_outletTypeMapping])
+    
+    # aggregate df into brand level
+    df_agg = df_source.groupby(by=['year', 'month', 'brand_name', 'store_code','competitor_type', 'store_category', 'year_mth','city_tier','city','area','district','province'],
+                               as_index=False, dropna=False).sum(['amount', 'ly_amount'])
+    
+    # merge total amount into df_agg
+    df_agg_total_amount = df_source_total_amount.groupby(by=['year', 'month', 'brand_name', 'store_category', 'year_mth','city_tier','city','area','district','province','store_code'],
+                                                         as_index=False, dropna=False).sum(['amount', 'ly_amount'])
+    df_agg_total_amount = df_agg_total_amount.rename(columns={'amount': 'total_amount', 'ly_amount': 'ly_total_amount'})
+    
+    df_agg = df_agg.merge(df_agg_total_amount, on=['year', 'month', 'brand_name', 'store_category', 'year_mth','city_tier','city','area','district','province','store_code'])
+    df_agg = df_agg[
+        ['year', 'month', 'brand_name', 'competitor_type', 'store_category', 'amount', 'ly_amount', 'total_amount',
+         'ly_total_amount', 'year_mth','city_tier','city','area','district','province','store_code']]
+    
+    # generate quarter columms' tag
+    dict_fiscal_quarter = {
+        1: 'Q3'
+        , 2: 'Q3'
+        , 3: 'Q3'
+        , 4: 'Q4'
+        , 5: 'Q4'
+        , 6: 'Q4'
+        , 7: 'Q1'
+        , 8: 'Q1'
+        , 9: 'Q1'
+        , 10: 'Q2'
+        , 11: 'Q2'
+        , 12: 'Q2'
+    }
+    
+    # add new column 'fiscal_year'
+    # when month >=7 ,fiscal_year = year+1, else fiscal_year = year
+    df_agg['fiscal_year'] = ''
+    df_agg.loc[df_agg['month'] >= 7, 'fiscal_year'] = df_agg['year'] + 1
+    df_agg.loc[df_agg['month'] < 7, 'fiscal_year'] = df_agg['year']
+    
+    # add quarter_tag
+    df_agg['quarter_tag'] = df_agg['fiscal_year'].astype(str) + df_agg['month'].map(dict_fiscal_quarter)
+    df_agg['year'] = df_agg['year'].astype('str')
+    df_agg['month'] = df_agg['month'].astype('str')
+    df_agg['year_mth'] = df_agg['year'] + df_agg['month'].str.zfill(2)
+    df_agg = df_agg[['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'year_mth', 'quarter_tag'
+    , 'store_category', 'total_amount', 'ly_total_amount','area','city_tier','city','district','province','store_code']]
+
+ 
+    # df_agg = df_agg[['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'year_mth', 'quarter_tag'
+    #     , 'store_category', 'total_amount', 'ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # # update stg_agg_competitor_sales_collection
+    # db.execute("""delete from prd_ds.tpr_dlabs_data_automation.stg_agg_competitor_sales_collection where year = {} and month = {}""".format(end_year, month))
+    
+    df_stg = df_agg.merge(df_store_name, on="store_code", how="left")
+    print(f"Stage table")
+    print(df_stg)
+
+    rs_conn_ind360.execute(
+        """delete from dlabs.stg_agg_competitor_sales_collection_store_location where year = {} and month = {};""".format(end_year, month))
+    # rs_conn_ind360.bulk_load(data_frame=df_agg
+    rs_conn_ind360.bulk_load(data_frame=df_stg
+                             , table_name='stg_agg_competitor_sales_collection_store_location'
+                             , schema_name='dlabs'
+                             , profile_name=None
+                             , drop_if_exists=False
+                             , bucket=bucket_name
+                             , prefix='competitor_app_scripts/staging/stg_agg_store_location'
+                             , iam=iam
+                             , file_name='stg_agg_competitor_sales_collection_store_location'
+                             , region=region
+                             )
+    
+    # # read full volume data from prd_ds.tpr_dlabs_data_automation.stg_agg_competitor_sales_collection
+    # df = db.get_records("""select * from prd_ds.tpr_dlabs_data_automation.stg_agg_competitor_sales_collection""")
+    df = rs_conn_ind360.get_records("select * from dlabs.stg_agg_competitor_sales_collection_store_location ")
+    # # exchange rate calculation
+    # df_exchange = pd.read_excel(exchange_file_path, exchange_sheet_name)
+    # ## Change made by visionet team: as now the exchange rate table is filled from cdl_mstr_pegrate where pegrate references to the exchange rate value and we put a join to mstr_calendar to fetch year numbers
+    df_exchange = rs_conn_crm.get_records("select * from cdlcrm.cdl_mstr_pegrate").fillna(value=0)
+    df_exchange=df_exchange[df_exchange['currency']=='CNY']
+    # df_exchange=df_exchange[df_exchange['fisc_year_num'] >= 2022]
+    df_calendar = rs_conn_crm.get_records("select * from cdlcrm.cdl_mstr_calendar")
+    
+    df_calendar=df_calendar.groupby('fisc_year_num')['calendar_date'].agg(start_yyyymm='min',end_yyyymm='max').reset_index()
+    
+    df_calendar["start_yyyymm"] = df_calendar["start_yyyymm"].dt.year.astype(str) + "07"
+    df_calendar["start_yyyymm"] = df_calendar["start_yyyymm"].astype(int)
+    
+    df_calendar["end_yyyymm"] = df_calendar["end_yyyymm"].dt.year.astype(str) + "06"
+    df_calendar["end_yyyymm"] = df_calendar["end_yyyymm"].astype(int)
+    
+    print(df_calendar[['start_yyyymm','end_yyyymm','fisc_year_num']])
+    
+    df_exchange=df_exchange.merge(df_calendar,how='inner',on='fisc_year_num')
+    
+    # df_exchange['start_yyyymm'] = df_exchange['start_day_num'].astype(int)
+    # df_exchange['end_yyyymm'] = df_exchange['end_day_num'].astype(int)
+    df_exchange = df_exchange.rename(columns={"peg_rate": "exchange_rate",'fisc_year_num':'fiscal_year'})
+    
+    df_exchange=df_exchange[['exchange_rate','fiscal_year','start_yyyymm','end_yyyymm']]
+    yyyymm = int(str(year_iterator) + str(month_iterator).zfill(2))
+    #yyyymm = int(str(get_ts().year) + str(get_ts().month).zfill(2))
+    print('yyyymm')
+    print(yyyymm)
+    
+    df_exchange = df_exchange[(df_exchange['start_yyyymm'] <= yyyymm) & (df_exchange['end_yyyymm'] >= yyyymm)]
+    
+    print('df_exchange')
+    print(df_exchange.head())
+    
+    df = df.merge(df_exchange, how='cross')
+    
+    df['usd_amount'] = df['amount']/df['exchange_rate']
+    df['usd_ly_amount'] = df['ly_amount']/df['exchange_rate']
+    df['usd_total_amount'] = df['total_amount']/df['exchange_rate']
+    df['usd_ly_total_amount'] = df['ly_total_amount']/df['exchange_rate']
+    
+    # # add null columns of rolling_12m_tag,ly_rolling_12m_tag
+    df['rolling_12m_tag'] = ''
+    df['ly_rolling_12m_tag'] = ''
+    
+    rolling_month_list = get_rolling_months_list(dt, 24)[0:12]
+    ly_rolling_month_list = get_rolling_months_list(dt, 24)[12:24]
+    print(rolling_month_list)
+    print(ly_rolling_month_list)
+    
+    for i in rolling_month_list:
+        df.loc[df['year_mth'] == i, 'rolling_12m_tag'] = 'Y'
+    
+    for i in ly_rolling_month_list:
+        df.loc[df['year_mth'] == i, 'ly_rolling_12m_tag'] = 'Y'
+    # df.to_csv('/home/dlab_dev/tmp/test5.csv')
+    # replace '-' as '' in yyyymm
+    # df['year_mth'] = df['year_mth'].apply(lambda x:x.replace('-',''))
+    
+    df = df[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    
+    ## add total
+    # for retail Competitors Total:
+    df_total_retail = df[(df['store_category'] == 'Retail') & (
+        df['competitor_type'].isin(["RTW", "Other Luxury", "Big Three Luxury Brands", "Men's"]))]
+    df_total_retail = df_total_retail.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount','usd_ly_total_amount']]
+    df_total_retail = df_total_retail.reset_index()
+    df_total_retail['brand_name'] = 'Competitors Total'
+    df_total_retail['competitor_type'] = 'Competitors Total'
+    df_total_retail['rolling_12m_tag'] = ''
+    df_total_retail['ly_rolling_12m_tag'] = ''
+    df_total_retail['total_store_count_growth'] = 0
+    
+    df_total_retail = df_total_retail[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for retail Competitor TTL excl. RTW:
+    df_total_retail_exclude_rtw = df[(df['store_category'] == 'Retail') & (
+        df['competitor_type'].isin(["Other Luxury", "Big Three Luxury Brands", "Men's"]))]
+    df_total_retail_exclude_rtw = \
+    df_total_retail_exclude_rtw.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_retail_exclude_rtw = df_total_retail_exclude_rtw.reset_index()
+    df_total_retail_exclude_rtw['brand_name'] = 'Competitor TTL excl. RTW'
+    df_total_retail_exclude_rtw['competitor_type'] = 'Competitor TTL excl. RTW'
+    df_total_retail_exclude_rtw['rolling_12m_tag'] = ''
+    df_total_retail_exclude_rtw['ly_rolling_12m_tag'] = ''
+    df_total_retail_exclude_rtw['total_store_count_growth'] = 0
+    
+    df_total_retail_exclude_rtw = df_total_retail_exclude_rtw[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for retail Big Three Luxury Brands:
+    df_total_retail_big_three = df[
+        (df['store_category'] == 'Retail') & (df['competitor_type'].isin(["Big Three Luxury Brands"]))]
+    df_total_retail_big_three = \
+    df_total_retail_big_three.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount','usd_ly_total_amount']]
+    df_total_retail_big_three = df_total_retail_big_three.reset_index()
+    df_total_retail_big_three['brand_name'] = 'Total'
+    df_total_retail_big_three['competitor_type'] = 'Big Three Luxury Brands'
+    df_total_retail_big_three['rolling_12m_tag'] = ''
+    df_total_retail_big_three['ly_rolling_12m_tag'] = ''
+    df_total_retail_big_three['total_store_count_growth'] = 0
+    
+    df_total_retail_big_three = df_total_retail_big_three[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for retail Other Luxury:
+    df_total_retail_other = df[(df['store_category'] == 'Retail') & (df['competitor_type'].isin(["Other Luxury"]))]
+    df_total_retail_other = \
+    df_total_retail_other.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_retail_other = df_total_retail_other.reset_index()
+    df_total_retail_other['brand_name'] = 'Total'
+    df_total_retail_other['competitor_type'] = 'Other Luxury'
+    df_total_retail_other['rolling_12m_tag'] = ''
+    df_total_retail_other['ly_rolling_12m_tag'] = ''
+    df_total_retail_other['total_store_count_growth'] = 0
+    
+    df_total_retail_other = df_total_retail_other[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for retail Men's:
+    df_total_retail_mens = df[(df['store_category'] == 'Retail') & (df['competitor_type'].isin(["Men's"]))]
+    df_total_retail_mens = \
+    df_total_retail_mens.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_retail_mens = df_total_retail_mens.reset_index()
+    df_total_retail_mens['brand_name'] = 'Total'
+    df_total_retail_mens['competitor_type'] = "Men's"
+    df_total_retail_mens['rolling_12m_tag'] = ''
+    df_total_retail_mens['ly_rolling_12m_tag'] = ''
+    df_total_retail_mens['total_store_count_growth'] = 0
+    
+    df_total_retail_mens = df_total_retail_mens[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for retail RTW:
+    df_total_retail_rtw = df[(df['store_category'] == 'Retail') & (df['competitor_type'].isin(["RTW"]))]
+    df_total_retail_rtw = \
+    df_total_retail_rtw.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_retail_rtw = df_total_retail_rtw.reset_index()
+    df_total_retail_rtw['brand_name'] = 'Total'
+    df_total_retail_rtw['competitor_type'] = 'RTW'
+    df_total_retail_rtw['rolling_12m_tag'] = ''
+    df_total_retail_rtw['ly_rolling_12m_tag'] = ''
+    df_total_retail_rtw['total_store_count_growth'] = 0
+    
+    df_total_retail_rtw = df_total_retail_rtw[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for outlet Competitors Total:
+    df_total_outlet = df[(df['store_category'] == 'Outlet') & (
+        df['competitor_type'].isin(["RTW", "Other Luxury", "Big Three Luxury Brands", "Men's"]))]
+    df_total_outlet = df_total_outlet.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_outlet = df_total_outlet.reset_index()
+    df_total_outlet['brand_name'] = 'Competitors Total'
+    df_total_outlet['competitor_type'] = 'Competitors Total'
+    df_total_outlet['rolling_12m_tag'] = ''
+    df_total_outlet['ly_rolling_12m_tag'] = ''
+    df_total_outlet['total_store_count_growth'] = 0
+    
+    df_total_outlet = df_total_outlet[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for outlet Competitor TTL excl. RTW:
+    df_total_outlet_exclude_rtw = df[(df['store_category'] == 'Outlet') & (
+        df['competitor_type'].isin(["Other Luxury", "Big Three Luxury Brands", "Men's"]))]
+    df_total_outlet_exclude_rtw = \
+    df_total_outlet_exclude_rtw.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_outlet_exclude_rtw = df_total_outlet_exclude_rtw.reset_index()
+    df_total_outlet_exclude_rtw['brand_name'] = 'Competitor TTL excl. RTW'
+    df_total_outlet_exclude_rtw['competitor_type'] = 'Competitor TTL excl. RTW'
+    df_total_outlet_exclude_rtw['rolling_12m_tag'] = ''
+    df_total_outlet_exclude_rtw['ly_rolling_12m_tag'] = ''
+    df_total_outlet_exclude_rtw['total_store_count_growth'] = 0
+    
+    df_total_outlet_exclude_rtw = df_total_outlet_exclude_rtw[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for outlet Big Three Luxury Brands:
+    df_total_outlet_big_three = df[
+        (df['store_category'] == 'Outlet') & (df['competitor_type'].isin(["Big Three Luxury Brands"]))]
+    df_total_outlet_big_three = \
+    df_total_outlet_big_three.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_outlet_big_three = df_total_outlet_big_three.reset_index()
+    df_total_outlet_big_three['brand_name'] = 'Total'
+    df_total_outlet_big_three['competitor_type'] = 'Big Three Luxury Brands'
+    df_total_outlet_big_three['rolling_12m_tag'] = ''
+    df_total_outlet_big_three['ly_rolling_12m_tag'] = ''
+    df_total_outlet_big_three['total_store_count_growth'] = 0
+    
+    df_total_outlet_big_three = df_total_outlet_big_three[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for outlet Other Luxury:
+    df_total_outlet_other = df[(df['store_category'] == 'Outlet') & (df['competitor_type'].isin(["Other Luxury"]))]
+    df_total_outlet_other = \
+    df_total_outlet_other.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_outlet_other = df_total_outlet_other.reset_index()
+    df_total_outlet_other['brand_name'] = 'Total'
+    df_total_outlet_other['competitor_type'] = 'Other Luxury'
+    df_total_outlet_other['rolling_12m_tag'] = ''
+    df_total_outlet_other['ly_rolling_12m_tag'] = ''
+    df_total_outlet_other['total_store_count_growth'] = 0
+    
+    df_total_outlet_other = df_total_outlet_other[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for outlet Men's:
+    df_total_outlet_mens = df[(df['store_category'] == 'Outlet') & (df['competitor_type'].isin(["Men's"]))]
+    df_total_outlet_mens = \
+    df_total_outlet_mens.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_outlet_mens = df_total_outlet_mens.reset_index()
+    df_total_outlet_mens['brand_name'] = 'Total'
+    df_total_outlet_mens['competitor_type'] = "Men's"
+    df_total_outlet_mens['rolling_12m_tag'] = ''
+    df_total_outlet_mens['ly_rolling_12m_tag'] = ''
+    df_total_outlet_mens['total_store_count_growth'] = 0
+    
+    df_total_outlet_mens = df_total_outlet_mens[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # for outlet RTW:
+    df_total_outlet_rtw = df[(df['store_category'] == 'Outlet') & (df['competitor_type'].isin(["RTW"]))]
+    df_total_outlet_rtw = \
+    df_total_outlet_rtw.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount']]
+    df_total_outlet_rtw = df_total_outlet_rtw.reset_index()
+    df_total_outlet_rtw['brand_name'] = 'Total'
+    df_total_outlet_rtw['competitor_type'] = 'RTW'
+    df_total_outlet_rtw['rolling_12m_tag'] = ''
+    df_total_outlet_rtw['ly_rolling_12m_tag'] = ''
+    df_total_outlet_rtw['total_store_count_growth'] = 0
+    
+    df_total_outlet_rtw = df_total_outlet_rtw[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+         'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+         
+    
+    df = pd.concat([df, df_total_retail, df_total_retail_exclude_rtw, df_total_retail_big_three, df_total_retail_other,
+                    df_total_retail_mens, df_total_retail_rtw, df_total_outlet, df_total_outlet_exclude_rtw,
+                    df_total_outlet_big_three, df_total_outlet_other, df_total_outlet_mens, df_total_outlet_rtw])
+    df=df[['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+     'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'total_amount',
+     'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','area','city_tier','city','district','province','store_code']]
+    
+    df_tmp = df.merge(df_store_name, on="store_code", how="left")
+    print(f"Temp table")
+
+    # load df into agg_competitor_sales_collection_tmp for data backup
+    rs_conn_ind360.execute("truncate table dlabs.agg_competitor_sales_collection_tmp_store_location")
+    # rs_conn_ind360.bulk_load(data_frame=df
+    rs_conn_ind360.bulk_load(data_frame=df_tmp
+                             , table_name='agg_competitor_sales_collection_tmp_store_location'
+                             , schema_name='dlabs'
+                             , profile_name=None
+                             , drop_if_exists=False
+                             , bucket=bucket_name
+                             , prefix='competitor_app_scripts/staging/agg_tmp_store_location'
+                             , iam=iam
+                             , file_name='agg_competitor_sales_collection_tmp_store_location'
+                             , region=region
+                             )
+    
+    # db.bulk_load(data_frame=df
+    #             ,table_name='agg_competitor_sales_collection_tmp'
+    #             ,schema_name='tpr_dlabs_data_automation'
+    #             ,database_name='prd_ds'
+    #             ,drop_if_exists = False)
+    
+    # load df_competitor_total_amount into agg_competitor_sales_collection
+    df_competitor_total_amount = df[df['brand_name'] == 'Competitors Total']
+    df_competitor_total_amount = df_competitor_total_amount[['year', 'month', 'amount', 'store_category','city_tier','city','area','district','province','store_code']]
+    df_competitor_total_amount.columns = ['year', 'month', 'competitor_total_amount', 'store_category','city_tier','city','area','district','province','store_code']
+    print('df_competitor_total_amount')
+    print(df_competitor_total_amount[['year', 'month', 'competitor_total_amount']].head())
+    df_competitor_total_amount = df.merge(df_competitor_total_amount, on=['year', 'month', 'store_category','city_tier','city','area','district','province','store_code'], how='left')
+    df_competitor_total_amount = df_competitor_total_amount[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'competitor_total_amount',
+         'total_amount', 'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    # insert brand quarterly data
+    # sum amount
+    df_competitor_total_amount_copy = df_competitor_total_amount.copy(deep=True)
+    df_competitor_total_amount_copy['competitor_type'] = df_competitor_total_amount_copy['competitor_type'].fillna('Null')
+    df_quarterly_amount = \
+    df_competitor_total_amount_copy.groupby(by=['brand_name', 'competitor_type', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']).sum()[
+        ['amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'total_amount', 'ly_total_amount', 'usd_total_amount',
+         'usd_ly_total_amount', 'competitor_total_amount']].reset_index()
+    
+    # merge latest store_count for each quarter
+    df_competitor_total_amount_copy['max_quarter_month'] = \
+    df_competitor_total_amount_copy.groupby(['brand_name', 'quarter_tag'])['month'].transform('max')
+    # print(df_competitor_total_amount_copy.loc[(df_competitor_total_amount_copy['brand_name']=='Fila') & (df_competitor_total_amount_copy['quarter_tag']=='2024Q3')])
+    df_competitor_total_amount_copy = df_competitor_total_amount_copy.loc[
+        df_competitor_total_amount_copy['month'] == df_competitor_total_amount_copy['max_quarter_month']]
+    # df_competitor_total_amount_copy = df_competitor_total_amount_copy.loc[df_competitor_total_amount_copy['brand_name']!='Total']
+    # df_competitor_total_amount.to_csv('/home/dlab_dev/tmp/test_4.csv')
+    df_quarterly_store_count = df_competitor_total_amount_copy[
+        ['brand_name', 'competitor_type', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']]
+    # print(df_quarterly_amount[df_quarterly_amount['brand_name'].isin(['Coach'])])
+    df_quarterly = df_quarterly_amount.merge(df_quarterly_store_count,
+                                             on=['brand_name', 'competitor_type', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code'])
+    df_quarterly['year'] = np.nan
+    df_quarterly['month'] = np.nan
+    df_quarterly['year_mth'] = df_quarterly['quarter_tag']
+    df_quarterly['rolling_12m_tag'] = ''
+    df_quarterly['ly_rolling_12m_tag'] = ''
+    df_quarterly['competitor_type'] = df_quarterly['competitor_type'].replace('Null', np.nan)
+    
+    df_quarterly = df_quarterly[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'competitor_total_amount',
+         'total_amount', 'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    df_competitor_total_amount = pd.concat([df_competitor_total_amount, df_quarterly])
+    
+    df_competitor_total_amount = df_competitor_total_amount[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'competitor_total_amount',
+         'total_amount', 'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    df_versus = df_competitor_total_amount.copy(deep=True)
+    df_versus = df_versus[
+        ['year', 'month', 'brand_name', 'usd_amount', 'usd_ly_amount', 'year_mth', 'quarter_tag', 'store_category','city_tier','city','area','district','province','store_code']]
+    df_versus['year'] = df_versus['year'].fillna('Null')
+    df_versus['month'] = df_versus['month'].fillna('Null')
+    
+    df_versus_coach = df_versus[df_versus['brand_name'] == 'Coach']
+    df_versus_competitor_total = df_versus[df_versus['brand_name'] == 'Competitors Total']
+    
+    df_versus_coach_competitor_total = df_versus_coach.merge(df_versus_competitor_total,
+                                                             on=['year', 'month', 'year_mth', 'quarter_tag',
+                                                                 'store_category','city_tier','city','area','district','province','store_code'], how='left')
+    df_versus_coach_competitor_total['brand_name'] = 'Coach vs. Competitor Total'
+    df_versus_coach_competitor_total['competitor_type'] = 'Gaps'
+    df_versus_coach_competitor_total['amount'] = np.nan
+    df_versus_coach_competitor_total['ly_amount'] = np.nan
+    df_versus_coach_competitor_total['usd_amount'] = np.nan
+    df_versus_coach_competitor_total['usd_ly_amount'] = np.nan
+    df_versus_coach_competitor_total['rolling_12m_tag'] = np.nan
+    df_versus_coach_competitor_total['ly_rolling_12m_tag'] = np.nan
+    df_versus_coach_competitor_total['competitor_total_amount'] = np.nan
+    df_versus_coach_competitor_total['total_amount'] = np.nan
+    df_versus_coach_competitor_total['ly_total_amount'] = np.nan
+    df_versus_coach_competitor_total['usd_total_amount'] = np.nan
+    df_versus_coach_competitor_total['usd_ly_total_amount'] = np.nan
+    
+    df_versus_coach_competitor_total = df_versus_coach_competitor_total[
+        ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+         'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'competitor_total_amount',
+         'total_amount', 'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','city_tier','city','area','district','province','store_code']]
+    
+    df_versus_coach_competitor_total['year'] = df_versus_coach_competitor_total['year'].replace('Null',np.nan)
+    df_versus_coach_competitor_total['month'] = df_versus_coach_competitor_total['month'].replace('Null',np.nan)
+    df_competitor_total_amount = pd.concat([df_competitor_total_amount, df_versus_coach_competitor_total])
+    df_competitor_total_amount['year'] = df_competitor_total_amount['year'].astype('Int64')
+    df_competitor_total_amount['month'] = df_competitor_total_amount['month'].astype('Int64')
+    df_competitor_total_amount['competitor_total_amount'] = df_competitor_total_amount['competitor_total_amount'].fillna(0).round().astype(int)
+    
+    df_competitor_total_amount = df_competitor_total_amount[
+    ['year', 'month', 'brand_name', 'competitor_type', 'amount', 'ly_amount', 'usd_amount', 'usd_ly_amount', 'year_mth',
+     'quarter_tag', 'rolling_12m_tag', 'ly_rolling_12m_tag', 'store_category', 'competitor_total_amount',
+     'total_amount', 'ly_total_amount', 'usd_total_amount', 'usd_ly_total_amount','area','city_tier','city','district','province','store_code']]
+    
+    df_store_location = df_competitor_total_amount.merge(df_store_name, on="store_code", how="left") 
+
+    rs_conn_ind360.execute("truncate table dlabs.agg_competitor_sales_collection_store_location")
+    
+    # rs_conn_ind360.bulk_load(data_frame=df_competitor_total_amount
+    rs_conn_ind360.bulk_load(data_frame=df_store_location
+                             , table_name='agg_competitor_sales_collection_store_location'
+                             , schema_name='dlabs'
+                             , profile_name=None
+                             , drop_if_exists=False
+                             , bucket=bucket_name
+                             , prefix='competitor_app_scripts/staging/agg_sales_collection_store_location'
+                             , iam=iam
+                             , file_name='agg_competitor_sales_collection_store_location'
+                             , region=region
+                             )
+    
+    # db.execute("truncate table prd_ds.tpr_dlabs_data_automation.agg_competitor_sales_collection")
+    # db.bulk_load(data_frame=df_competitor_total_amount
+    #             ,table_name='agg_competitor_sales_collection'
+    #             ,schema_name='tpr_dlabs_data_automation'
+    #             ,database_name='prd_ds'
+    #             ,drop_if_exists = False)
+    
+    # load data into x-location table
+    df = df_competitor_total_amount.copy(deep=True)
+    df = df[['year', 'month', 'brand_name', 'amount', 'year_mth', 'quarter_tag','city_tier','city','area','district','province','store_code']]
+    #df = df[['year', 'month', 'brand_name', 'amount', 'year_mth', 'quarter_tag']]
+    df = df.loc[df['brand_name'].isin(
+        ['Coach (Gucci X-Locations)', 'Gucci (X-Locations)', 'Coach (Kate Spade X-Locations)', 'Kate Spade (X-Locations)',
+         'Coach (MCM X-Locations)', 'MCM (X-Locations)', 'Coach (Michael Kors X-Locations)',
+         'Michael Kors (X-Locations)']),]
+    df['year'] = df['year'].astype('Int64')   
+    df['month'] = df['month'].astype('Int64')
+    
+    #df = df.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'brand_name'])['amount'].sum().reset_index()
+    df = df.groupby(by=['year', 'month', 'year_mth', 'quarter_tag', 'brand_name','city_tier','city','area','district','province','store_code'])['amount'].sum().reset_index()
+    df['year'] = df['year'].replace('Null', np.nan)
+    df['month'] = df['month'].replace('Null', np.nan)
+    
+    df = pd.pivot(df, index=['year', 'month', 'year_mth', 'quarter_tag','city_tier','city','area','district','province','store_code'], columns=['brand_name'],
+                  values=['amount']).reset_index()
+    #df = df.fillna(0)
+    
+    #print(df.show(5))
+    df.columns = ['year','month','year_mth','quarter_tag','city_tier','city','area','district','province','store_code','coach_gucci_x_locations','coach_kate_spade_x_locations','coach_mcm_x_locations','coach_michael_kors_x_locations','gucci_x_locations','kate_spade_x_locations','mcm_x_locations','michael_kors_x_locations']
+    df = df[['year','month','year_mth','quarter_tag','coach_gucci_x_locations','gucci_x_locations','coach_kate_spade_x_locations','kate_spade_x_locations','coach_mcm_x_locations','mcm_x_locations','coach_michael_kors_x_locations','michael_kors_x_locations','area','city_tier','city','district','province','store_code']]
+    
+    df_x_location = df.merge(df_store_name, on="store_code", how="left") 
+
+    rs_conn_ind360.execute("truncate table dlabs.agg_competitor_sales_collection_x_location_store_location")
+    print('agg_competitor_sales_collection_x_location')
+    #print(df.head())
+    #print(df.columns)
+    # rs_conn_ind360.bulk_load(data_frame=df
+    rs_conn_ind360.bulk_load(data_frame=df_x_location
+                              , table_name='agg_competitor_sales_collection_x_location_store_location'
+                             , schema_name='dlabs'
+                            , profile_name=None
+                             , drop_if_exists=False
+                             , bucket=bucket_name
+                             , prefix='competitor_app_scripts/staging/x-location_store_location'
+                             , iam=iam
+                             , file_name='agg_competitor_sales_collection_x_location_store_location'
+                             , region=region
+                             )
+    
+    
+    # db.execute("truncate table prd_ds.tpr_dlabs_data_automation.agg_competitor_sales_collection_x_location_area_level")
+    # db.bulk_load(data_frame=df
+    #             ,table_name='agg_competitor_sales_collection_x_location_area_level'
+    #             ,schema_name='tpr_dlabs_data_automation'
+    #             ,database_name='prd_ds'
+    #             ,drop_if_exists = False)
+    
+    print('done!')
+
+    month_iterator += 1
+    if month_iterator == 13:
+        month_iterator=1
+        year_iterator+=1
